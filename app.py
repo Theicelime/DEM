@@ -26,20 +26,20 @@ st.markdown("""
 <style>
     .stApp { background-color: #f5f5f7; }
     div[data-testid="stSidebar"] { background-color: rgba(255,255,255,0.95); }
-    .stButton>button { border-radius: 8px; font-weight: 600; border: 1px solid #d1d1d6; }
-    .stButton>button:hover { border-color: #007AFF; color: #007AFF; background: #fff; }
+    .stButton>button { border-radius: 8px; font-weight: 600; }
+    .debug-box { background: #eee; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 12px; word-break: break-all;}
 </style>
 """, unsafe_allow_html=True)
 
 # --- 3. 逻辑函数 ---
 
 def get_location(query):
-    geolocator = Nominatim(user_agent="geo_app_v_final_fix")
+    geolocator = Nominatim(user_agent="geo_debugger_v6")
     try:
         location = geolocator.geocode(query, timeout=10)
         if location:
             return location.latitude, location.longitude, location.address
-    except Exception:
+    except Exception as e:
         return None
     return None
 
@@ -55,100 +55,56 @@ def generate_geometry(lat, lon, shape, width_km, height_km, radius_km):
         geom = box(west, south, east, north)
         desc = f"{width_km}x{height_km}km"
     else:
-        # 近似圆
         geom = center_pt.buffer(radius_km / 111.0)
         desc = f"R{radius_km}km"
         
     return geom, desc
 
-def fetch_opentopo_dem(bounds, api_key, dataset="SRTMGL1"):
-    """
-    双引擎下载逻辑：
-    SRTMGL1 -> 使用 usgsDem 接口 (极其稳定)
-    COP30   -> 使用 globalDem 接口 (不稳定，容易404)
-    """
+def get_opentopo_url(bounds, api_key):
+    """只生成 URL，不下载，方便调试"""
     minx, miny, maxx, maxy = [round(x, 5) for x in bounds]
     
-    if dataset == "SRTMGL1":
-        # 方案 A: SRTM (稳健)
-        url = "https://portal.opentopography.org/API/usgsDem"
-        params = {
-            'datasetName': 'SRTMGL1', # 30m 精度
-            'south': miny, 'north': maxy, 'west': minx, 'east': maxx,
-            'outputFormat': 'GTiff',
-            'API_Key': api_key
-        }
-    else:
-        # 方案 B: Copernicus (新，但不稳)
-        url = "https://portal.opentopography.org/API/globalDem"
-        params = {
-            'demType': 'COP30',
-            'south': miny, 'north': maxy, 'west': minx, 'east': maxx,
-            'outputFormat': 'GTiff',
-            'API_Key': api_key
-        }
+    # 强制修正：防止范围过小导致 API 报错
+    if (maxx - minx) < 0.001: maxx += 0.001; minx -= 0.001
+    if (maxy - miny) < 0.001: maxy += 0.001; miny -= 0.001
+
+    base_url = "https://portal.opentopography.org/API/globalDem"
+    params = f"demType=SRTMGL1&south={miny}&north={maxy}&west={minx}&east={maxx}&outputFormat=GTiff&API_Key={api_key}"
     
-    try:
-        r = requests.get(url, params=params, stream=True, timeout=60)
-        
-        if r.status_code == 200:
-            ctype = r.headers.get('Content-Type', '')
-            if 'text/html' in ctype:
-                return False, f"API 返回错误信息 (可能是 Key 无效或范围过大): {r.text[:300]}"
-            return True, r.content
-        elif r.status_code == 404:
-            return False, f"404 未找到。原因：所选数据源 {dataset} 在该区域无覆盖，或 API 暂时不可用。请尝试切换数据源为 SRTMGL1。"
-        elif r.status_code == 401:
-            return False, "401 未授权。请检查 API Key 是否正确。"
-        else:
-            return False, f"HTTP Error {r.status_code}: {r.reason}"
-    except Exception as e:
-        return False, str(e)
+    return f"{base_url}?{params}"
 
 # --- 4. 侧边栏 ---
 
 with st.sidebar:
-    st.title("🎛️ 设置面板")
+    st.title("🎛️ Geo Master Debug")
     
     if 'lat' not in st.session_state:
-        st.session_state.update({'lat': 34.4871, 'lon': 110.0847, 'addr': 'Hua Shan'})
+        st.session_state.update({'lat': 34.4871, 'lon': 110.0847, 'addr': 'Hua Shan'}) 
     
-    q = st.text_input("📍 地点搜索", "华山")
+    q = st.text_input("📍 地点", "华山")
     if st.button("搜索"):
         res = get_location(q)
         if res:
             st.session_state['lat'], st.session_state['lon'], st.session_state['addr'] = res
             st.success("已定位")
             st.rerun()
-        else:
-            st.error("未找到")
             
     st.divider()
     
     shape = st.selectbox("形状", ["矩形 (Rectangle)", "圆形 (Circle)"])
     if shape == "矩形 (Rectangle)":
         c1, c2 = st.columns(2)
-        w = c1.number_input("宽 (km)", 0.1, 200.0, 10.0)
-        h = c2.number_input("高 (km)", 0.1, 200.0, 10.0)
+        w = c1.number_input("宽 (km)", 0.1, 500.0, 10.0)
+        h = c2.number_input("高 (km)", 0.1, 500.0, 10.0)
         r = 0
     else:
-        r = st.number_input("半径 (km)", 0.1, 100.0, 5.0)
+        r = st.number_input("半径 (km)", 0.1, 200.0, 5.0)
         w, h = 0, 0
         
     st.divider()
-    
-    # === 关键修改：数据源选择 ===
-    st.subheader("📡 数据源")
-    dem_source = st.selectbox(
-        "选择高程数据类型", 
-        ["SRTMGL1 (推荐, 最稳)", "COP30 (新, 易报错)"],
-        index=0
-    )
-    dataset_code = "SRTMGL1" if "SRTM" in dem_source else "COP30"
-    
-    api_key = st.text_input("🔑 API Key (必填)", type="password")
+    api_key = st.text_input("🔑 API Key (必填)", type="password", help="没有 Key 肯定会失败")
     if not api_key:
-        st.warning("请填写 Key，否则 99% 会下载失败")
+        st.error("⚠️ 必须填写 API Key")
 
 # --- 5. 主界面 ---
 
@@ -159,13 +115,11 @@ geom, desc = generate_geometry(st.session_state['lat'], st.session_state['lon'],
 gdf = gpd.GeoDataFrame({'geometry': [geom]}, crs="EPSG:4326")
 bounds = geom.bounds
 
-# 动态地图 Key
-map_key = f"map_{st.session_state['lat']}_{st.session_state['lon']}_{w}_{h}_{r}"
-
+# 地图
+map_key = f"map_{st.session_state['lat']}_{st.session_state['lon']}_{shape}_{w}"
 m = folium.Map([st.session_state['lat'], st.session_state['lon']], zoom_start=12)
-folium.GeoJson(gdf, style_function=lambda x: {'color':'#007AFF', 'fillOpacity':0.2}).add_to(m)
+folium.GeoJson(gdf).add_to(m)
 folium.Marker([st.session_state['lat'], st.session_state['lon']]).add_to(m)
-
 st_folium(m, height=400, width="100%", key=map_key)
 
 st.divider()
@@ -177,23 +131,45 @@ with c1:
 
 with c2:
     st.subheader("2. 高程 (DEM)")
-    st.caption(f"当前使用源: {dataset_code}")
     
-    if 'dem_data' not in st.session_state: st.session_state['dem_data'] = None
+    # 生成直接下载链接
+    direct_url = get_opentopo_url(bounds, api_key)
     
-    if st.button("🚀 获取 DEM", use_container_width=True):
+    # 状态：Python 后端下载
+    if 'dem_file' not in st.session_state: st.session_state['dem_file'] = None
+
+    if st.button("🚀 获取 DEM (SRTM 30m)", use_container_width=True):
         if not api_key:
-            st.error("❌ 必须填写 API Key 才能使用 API 下载")
+            st.error("请先填写 API Key")
         else:
-            with st.spinner(f"正在从 {dataset_code} 下载..."):
-                # 调用函数
-                ok, d = fetch_opentopo_dem(bounds, api_key, dataset_code)
-                if ok:
-                    st.session_state['dem_data'] = d
-                    st.success("✅ 下载成功！")
-                    st.rerun()
-                else:
-                    st.error(d)
-                    
-    if st.session_state['dem_data']:
-        st.download_button("💾 保存 .TIF", st.session_state['dem_data'], f"DEM_{desc}_{dataset_code}.tif", "image/tiff", type="primary", use_container_width=True)
+            with st.spinner("正在请求数据..."):
+                try:
+                    # 使用 generated URL 请求
+                    r = requests.get(direct_url, stream=True, timeout=60)
+                    if r.status_code == 200:
+                        if 'text/html' in r.headers.get('Content-Type', ''):
+                             st.error("API 返回了错误页面，请查看下方调试链接")
+                        else:
+                            st.session_state['dem_file'] = r.content
+                            st.success("成功！")
+                            st.rerun()
+                    elif r.status_code == 401:
+                        st.error("API Key 错误 (401)")
+                    elif r.status_code == 404:
+                        st.error("404: 范围无效或数据源不支持该区域")
+                    else:
+                        st.error(f"HTTP {r.status_code}")
+                except Exception as e:
+                    st.error(f"连接超时: {e}")
+
+    # 保存按钮
+    if st.session_state['dem_file']:
+        st.download_button("💾 保存文件", st.session_state['dem_file'], f"DEM_{desc}.tif", "image/tiff", type="primary", use_container_width=True)
+
+    # === 调试区域 (Plan B) ===
+    st.markdown("---")
+    st.caption("🛠️ **调试与备用方案**")
+    st.write("如果上方按钮失败，请直接点击下方链接下载。如果浏览器打开显示 'Unauthorized'，说明 Key 错；显示 'Coverage' 错误，说明该地无数据。")
+    st.link_button("👉 点击直接在浏览器下载 (Plan B)", direct_url)
+    with st.expander("查看生成的 API 链接"):
+        st.code(direct_url)
