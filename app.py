@@ -157,4 +157,13 @@ with c2:
     st.write("") # Spacer
     
     # 使用 link_button 直接跳转
-    st.link_button("👉 点击
+    st.link_button("👉 点击跳转 OpenTopography 下载页", portal_url, type="primary", use_container_width=True)
+    
+    with st.expander("❓ 跳转后怎么做？"):
+        st.write("""
+        1. 点击上方按钮，会打开新网页。
+        2. **不要修改** 网页上的坐标。
+        3. 直接滑到网页 **最底部**。
+        4. 点击 **Submit** 按钮。
+        5. 等待几秒，点击 **rasters.tar.gz** 下载即可。
+        """)
