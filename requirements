@@ -1,0 +1,8 @@
+streamlit
+geopandas
+shapely
+folium
+streamlit-folium
+geopy
+requests
+xyzservices
