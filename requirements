@@ -6,3 +6,4 @@ streamlit-folium
 geopy
 requests
 xyzservices
+rtree
