@@ -3,57 +3,47 @@ import time
 import requests
 import os
 
-# --- 1. 环境与依赖初始化 ---
-# 强制使用 Pyogrio 引擎 (自带 GDAL 二进制，解决 Linux 依赖冲突)
+# --- 1. 环境配置 ---
 os.environ["USE_PYGEOS"] = "0" 
 
 try:
     import pyogrio
     import geopandas as gpd
-    # 尝试设置默认引擎
     gpd.options.io_engine = "pyogrio"
-    
     from shapely.geometry import box, Point
     from geopy.geocoders import Nominatim
     from geopy.distance import distance as geodist
     import folium
     from streamlit_folium import st_folium
 except ImportError as e:
-    st.error(f"""
-    ❌ 环境加载失败: {e}
-    请确保 requirements.txt 包含: streamlit, geopandas, shapely>=2.0, pyogrio, folium, streamlit-folium, geopy, requests
-    并删除 packages.txt。
-    """)
+    st.error(f"❌ 环境错误: {e}")
     st.stop()
 
-# --- 2. 页面配置 ---
-st.set_page_config(page_title="Geo Data Master", page_icon="⛰️", layout="wide")
+# --- 2. 页面设置 ---
+st.set_page_config(page_title="Geo Data Master", page_icon="🌍", layout="wide")
 
 st.markdown("""
 <style>
     .stApp { background-color: #f5f5f7; }
     div[data-testid="stSidebar"] { background-color: rgba(255,255,255,0.95); }
-    .stButton>button { border-radius: 8px; border: 1px solid #d1d1d6; font-weight:600; }
-    .stButton>button:hover { border-color: #007AFF; color: #007AFF; }
+    .stButton>button { border-radius: 8px; font-weight: 600; border: 1px solid #d1d1d6; }
+    .stButton>button:hover { border-color: #007AFF; color: #007AFF; background: #fff; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 3. 核心逻辑 ---
+# --- 3. 逻辑函数 ---
 
 def get_location(query):
-    """搜索地点"""
-    # 使用自定义 User-Agent 避免被 OpenStreetMap 403 拒绝
-    geolocator = Nominatim(user_agent="geo_master_fix_v8")
+    geolocator = Nominatim(user_agent="geo_app_v_final_fix")
     try:
         location = geolocator.geocode(query, timeout=10)
         if location:
             return location.latitude, location.longitude, location.address
-    except Exception as e:
-        print(f"Geo error: {e}")
+    except Exception:
+        return None
     return None
 
 def generate_geometry(lat, lon, shape, width_km, height_km, radius_km):
-    """生成几何图形"""
     center_loc = (lat, lon)
     center_pt = Point(lon, lat)
     
@@ -65,87 +55,76 @@ def generate_geometry(lat, lon, shape, width_km, height_km, radius_km):
         geom = box(west, south, east, north)
         desc = f"{width_km}x{height_km}km"
     else:
-        # 缓冲圆
+        # 近似圆
         geom = center_pt.buffer(radius_km / 111.0)
         desc = f"R{radius_km}km"
         
     return geom, desc
 
-def fetch_dem_data(bounds, dataset, api_key):
+def fetch_opentopo_dem(bounds, api_key, dataset="SRTMGL1"):
     """
-    下载 DEM 数据的核心函数 (已修正 API 端点)
+    双引擎下载逻辑：
+    SRTMGL1 -> 使用 usgsDem 接口 (极其稳定)
+    COP30   -> 使用 globalDem 接口 (不稳定，容易404)
     """
     minx, miny, maxx, maxy = [round(x, 5) for x in bounds]
     
-    # 修正点：使用 globalDem 接口，参数名为 demType
-    url = "https://portal.opentopography.org/API/globalDem"
-    
-    params = {
-        'demType': dataset,  # SRTMGL1 或 COP30
-        'south': miny,
-        'north': maxy,
-        'west': minx,
-        'east': maxx,
-        'outputFormat': 'GTiff',
-        'API_Key': api_key
-    }
+    if dataset == "SRTMGL1":
+        # 方案 A: SRTM (稳健)
+        url = "https://portal.opentopography.org/API/usgsDem"
+        params = {
+            'datasetName': 'SRTMGL1', # 30m 精度
+            'south': miny, 'north': maxy, 'west': minx, 'east': maxx,
+            'outputFormat': 'GTiff',
+            'API_Key': api_key
+        }
+    else:
+        # 方案 B: Copernicus (新，但不稳)
+        url = "https://portal.opentopography.org/API/globalDem"
+        params = {
+            'demType': 'COP30',
+            'south': miny, 'north': maxy, 'west': minx, 'east': maxx,
+            'outputFormat': 'GTiff',
+            'API_Key': api_key
+        }
     
     try:
-        response = requests.get(url, params=params, stream=True, timeout=90)
+        r = requests.get(url, params=params, stream=True, timeout=60)
         
-        # 状态码判断
-        if response.status_code == 200:
-            # 检查是否返回了纯文本错误 (API 有时返回 200 但内容是 Error)
-            content_type = response.headers.get('Content-Type', '')
-            if 'text/html' in content_type or 'application/json' in content_type:
-                 # 尝试读取前200个字符看是不是报错
-                try:
-                    error_text = response.text[:300]
-                    if "Invalid public API key" in error_text:
-                        return False, "API Key 无效或未授权"
-                    return False, f"API 返回错误信息: {error_text}"
-                except:
-                    pass
-            return True, response.content
-            
-        elif response.status_code == 401:
-            return False, "401 未授权: 必须填写正确的 API Key"
-        elif response.status_code == 400:
-            return False, "400 请求错误: 可能是范围太大(超过1亿个点)或参数不对"
-        elif response.status_code == 404:
-            return False, "404 未找到: 该区域可能没有数据覆盖"
-        elif response.status_code == 500:
-            return False, "500 服务器错误: OpenTopography 服务器暂时繁忙"
+        if r.status_code == 200:
+            ctype = r.headers.get('Content-Type', '')
+            if 'text/html' in ctype:
+                return False, f"API 返回错误信息 (可能是 Key 无效或范围过大): {r.text[:300]}"
+            return True, r.content
+        elif r.status_code == 404:
+            return False, f"404 未找到。原因：所选数据源 {dataset} 在该区域无覆盖，或 API 暂时不可用。请尝试切换数据源为 SRTMGL1。"
+        elif r.status_code == 401:
+            return False, "401 未授权。请检查 API Key 是否正确。"
         else:
-            return False, f"HTTP {response.status_code}"
-            
+            return False, f"HTTP Error {r.status_code}: {r.reason}"
     except Exception as e:
         return False, str(e)
 
 # --- 4. 侧边栏 ---
 
 with st.sidebar:
-    st.header("🎛️ 设置面板")
+    st.title("🎛️ 设置面板")
     
-    # Session State
     if 'lat' not in st.session_state:
-        st.session_state.update({'lat': 27.9881, 'lon': 86.9250, 'addr': 'Mount Everest'})
+        st.session_state.update({'lat': 34.4871, 'lon': 110.0847, 'addr': 'Hua Shan'})
     
-    # 1. 搜索
-    q = st.text_input("📍 地点搜索", "珠穆朗玛峰")
-    if st.button("🔍 定位"):
+    q = st.text_input("📍 地点搜索", "华山")
+    if st.button("搜索"):
         res = get_location(q)
         if res:
             st.session_state['lat'], st.session_state['lon'], st.session_state['addr'] = res
             st.success("已定位")
-            time.sleep(0.5)
             st.rerun()
         else:
-            st.error("未找到，请尝试英文名称")
-
+            st.error("未找到")
+            
     st.divider()
-
-    # 2. 形状参数
+    
     shape = st.selectbox("形状", ["矩形 (Rectangle)", "圆形 (Circle)"])
     if shape == "矩形 (Rectangle)":
         c1, c2 = st.columns(2)
@@ -155,86 +134,66 @@ with st.sidebar:
     else:
         r = st.number_input("半径 (km)", 0.1, 100.0, 5.0)
         w, h = 0, 0
-
+        
     st.divider()
-
-    # 3. DEM 选项
-    st.subheader("⛰️ DEM 数据源")
-    dem_source = st.selectbox(
-        "选择数据集", 
-        ["COP30 (Copernicus 30m)", "SRTMGL1 (SRTM 30m)"], 
-        index=0,
-        help="COP30 质量更好，但 SRTM 有时下载更容易"
-    )
-    dataset_code = "COP30" if "COP30" in dem_source else "SRTMGL1"
     
-    api_key = st.text_input("🔑 API Key (必填)", type="password", help="去 my.opentopography.org 申请")
+    # === 关键修改：数据源选择 ===
+    st.subheader("📡 数据源")
+    dem_source = st.selectbox(
+        "选择高程数据类型", 
+        ["SRTMGL1 (推荐, 最稳)", "COP30 (新, 易报错)"],
+        index=0
+    )
+    dataset_code = "SRTMGL1" if "SRTM" in dem_source else "COP30"
+    
+    api_key = st.text_input("🔑 API Key (必填)", type="password")
     if not api_key:
-        st.warning("⚠️ 必须填写 API Key 才能下载")
+        st.warning("请填写 Key，否则 99% 会下载失败")
 
 # --- 5. 主界面 ---
 
 st.title("Geo Data Master")
-st.caption(f"📍 当前中心: {st.session_state['addr']}")
+st.caption(f"当前中心: {st.session_state['addr']}")
 
-# 计算
 geom, desc = generate_geometry(st.session_state['lat'], st.session_state['lon'], shape, w, h, r)
 gdf = gpd.GeoDataFrame({'geometry': [geom]}, crs="EPSG:4326")
-bounds = geom.bounds # (minx, miny, maxx, maxy)
+bounds = geom.bounds
 
-# 地图 Key 强制刷新
-map_key = f"m_{st.session_state['lat']}_{st.session_state['lon']}_{shape}_{w}_{h}"
+# 动态地图 Key
+map_key = f"map_{st.session_state['lat']}_{st.session_state['lon']}_{w}_{h}_{r}"
 
-m = folium.Map([st.session_state['lat'], st.session_state['lon']], zoom_start=12, tiles="OpenStreetMap")
-folium.GeoJson(gdf, style_function=lambda x: {'color':'#007AFF', 'fillOpacity':0.15}).add_to(m)
-folium.Marker([st.session_state['lat'], st.session_state['lon']], tooltip="Center").add_to(m)
+m = folium.Map([st.session_state['lat'], st.session_state['lon']], zoom_start=12)
+folium.GeoJson(gdf, style_function=lambda x: {'color':'#007AFF', 'fillOpacity':0.2}).add_to(m)
+folium.Marker([st.session_state['lat'], st.session_state['lon']]).add_to(m)
 
-st_folium(m, height=450, width="100%", key=map_key)
+st_folium(m, height=400, width="100%", key=map_key)
 
 st.divider()
 
-# --- 6. 下载区 ---
-
 c1, c2 = st.columns(2)
-
 with c1:
-    st.subheader("1. 范围文件")
-    st.download_button(
-        "⬇️ 下载 GeoJSON",
-        gdf.to_json(),
-        f"{q}_{desc}.geojson",
-        "application/geo+json",
-        use_container_width=True
-    )
+    st.subheader("1. 矢量 (GeoJSON)")
+    st.download_button("⬇️ 下载 GeoJSON", gdf.to_json(), f"{desc}.geojson", "application/geo+json", use_container_width=True)
 
 with c2:
-    st.subheader("2. 高程数据")
+    st.subheader("2. 高程 (DEM)")
+    st.caption(f"当前使用源: {dataset_code}")
     
-    # 状态缓存
-    if 'dem_blob' not in st.session_state: st.session_state['dem_blob'] = None
+    if 'dem_data' not in st.session_state: st.session_state['dem_data'] = None
     
-    btn_text = f"🚀 获取 {dataset_code} 数据"
-    if st.button(btn_text, use_container_width=True):
+    if st.button("🚀 获取 DEM", use_container_width=True):
         if not api_key:
-            st.error("请先在左侧填写 API Key！")
+            st.error("❌ 必须填写 API Key 才能使用 API 下载")
         else:
-            with st.spinner(f"正在向 OpenTopography 请求 {dataset_code} ..."):
-                success, data = fetch_dem_data(bounds, dataset_code, api_key)
-                
-                if success:
-                    st.session_state['dem_blob'] = data
-                    st.success("下载成功！请点击下方按钮保存。")
-                    st.rerun() # 刷新以显示下载按钮
+            with st.spinner(f"正在从 {dataset_code} 下载..."):
+                # 调用函数
+                ok, d = fetch_opentopo_dem(bounds, api_key, dataset_code)
+                if ok:
+                    st.session_state['dem_data'] = d
+                    st.success("✅ 下载成功！")
+                    st.rerun()
                 else:
-                    st.error(f"下载失败: {data}")
-
-    # 只有当数据存在时才显示保存按钮
-    if st.session_state['dem_blob']:
-        st.download_button(
-            label="💾 保存 .TIF 文件",
-            data=st.session_state['dem_blob'],
-            file_name=f"{q}_{desc}_{dataset_code}.tif",
-            mime="image/tiff",
-            type="primary",
-            use_container_width=True
-        )
+                    st.error(d)
+                    
+    if st.session_state['dem_data']:
+        st.download_button("💾 保存 .TIF", st.session_state['dem_data'], f"DEM_{desc}_{dataset_code}.tif", "image/tiff", type="primary", use_container_width=True)
