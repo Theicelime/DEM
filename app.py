@@ -3,36 +3,20 @@ import time
 import requests
 import os
 
-# --- 1. 核心环境配置 ---
-# 这一步非常关键：告诉系统优先使用 Pyogrio (自带GDAL)，而不是去寻找不存在的系统库
+# --- 1. 环境配置 ---
 os.environ["USE_PYGEOS"] = "0" 
 
 try:
-    # 尝试导入必要的库
     import pyogrio
     import geopandas as gpd
-    
-    # 强制 GeoPandas 使用 Pyogrio 引擎
     gpd.options.io_engine = "pyogrio"
-    
     from shapely.geometry import box, Point
     from geopy.geocoders import Nominatim
     from geopy.distance import distance as geodist
     import folium
     from streamlit_folium import st_folium
-
 except ImportError as e:
-    # 这里的错误提示更新了，不再误导你去改 packages.txt
-    st.error(f"""
-    ❌ **核心组件加载失败**
-    
-    原因: {e}
-    
-    **修复方法**:
-    1. 确保 GitHub 仓库中 **已删除 packages.txt** (必须删除)。
-    2. 确保 requirements.txt 中包含 `pyogrio`。
-    3. 在 Streamlit 后台点击 'Reboot App' 清除缓存。
-    """)
+    st.error(f"❌ 环境错误: {e}")
     st.stop()
 
 # --- 2. 页面设置 ---
@@ -50,12 +34,14 @@ st.markdown("""
 # --- 3. 逻辑函数 ---
 
 def get_location(query):
-    geolocator = Nominatim(user_agent="geo_tool_final")
+    # 更换 User-Agent 防止被 OpenStreetMap 拦截
+    geolocator = Nominatim(user_agent="my_geo_app_v5_unique")
     try:
-        location = geolocator.geocode(query, timeout=10)
+        location = geolocator.geocode(query, timeout=15) # 增加超时时间
         if location:
             return location.latitude, location.longitude, location.address
-    except:
+    except Exception as e:
+        print(f"Geocoding error: {e}") # 在后台打印错误
         return None
     return None
 
@@ -80,21 +66,32 @@ def generate_geometry(lat, lon, shape, width_km, height_km, radius_km):
 def fetch_opentopo_dem(bounds, api_key):
     minx, miny, maxx, maxy = [round(x, 5) for x in bounds]
     
-    url = "https://portal.opentopography.org/API/usgsDem"
+    # --- 关键修复：使用 globalDem 接口 ---
+    url = "https://portal.opentopography.org/API/globalDem"
     params = {
-        'datasetName': 'COP30', 
-        'south': miny, 'north': maxy, 'west': minx, 'east': maxx,
+        'demType': 'COP30',  # 参数名从 datasetName 改为 demType
+        'south': miny, 
+        'north': maxy, 
+        'west': minx, 
+        'east': maxx,
         'outputFormat': 'GTiff',
         'API_Key': api_key
     }
     
     try:
         r = requests.get(url, params=params, stream=True, timeout=60)
+        
+        # 调试信息：如果失败，尝试打印原因
         if r.status_code == 200:
             if 'text/html' in r.headers.get('Content-Type', ''):
-                return False, f"API Error: {r.text[:200]}"
+                return False, f"API 鉴权失败或忙: {r.text[:200]}"
             return True, r.content
-        return False, f"Status {r.status_code}"
+        elif r.status_code == 401:
+            return False, "API Key 无效或未填写"
+        elif r.status_code == 404:
+            return False, "404 错误：该区域无 COP30 数据覆盖，或 API 地址变动"
+        else:
+            return False, f"HTTP Error {r.status_code}: {r.reason}"
     except Exception as e:
         return False, str(e)
 
@@ -103,47 +100,58 @@ def fetch_opentopo_dem(bounds, api_key):
 with st.sidebar:
     st.title("🎛️ Geo Master")
     
+    # 状态初始化
     if 'lat' not in st.session_state:
-        st.session_state.update({'lat': 27.9881, 'lon': 86.9250, 'addr': 'Everest'})
+        st.session_state.update({'lat': 34.4871, 'lon': 110.0847, 'addr': 'Hua Shan (Default)'}) # 默认改为华山附近
     
-    q = st.text_input("📍 地点", "珠穆朗玛峰")
+    q = st.text_input("📍 地点", "华山")
     if st.button("搜索"):
-        res = get_location(q)
-        if res:
-            st.session_state['lat'], st.session_state['lon'], st.session_state['addr'] = res
-            st.success("已定位")
-            st.rerun()
-        else:
-            st.error("无结果")
+        with st.spinner("正在搜索..."):
+            res = get_location(q)
+            if res:
+                st.session_state['lat'], st.session_state['lon'], st.session_state['addr'] = res
+                st.success(f"已定位: {res[2][:20]}...")
+                time.sleep(0.5)
+                st.rerun()
+            else:
+                st.error("未找到地点，请尝试输入英文拼音 (e.g. 'Hua Shan')")
             
     st.divider()
     
     shape = st.selectbox("形状", ["矩形 (Rectangle)", "圆形 (Circle)"])
     if shape == "矩形 (Rectangle)":
         c1, c2 = st.columns(2)
-        w = c1.number_input("宽 (km)", 1.0, 500.0, 10.0)
-        h = c2.number_input("高 (km)", 1.0, 500.0, 10.0)
+        w = c1.number_input("宽 (km)", 0.1, 500.0, 10.0)
+        h = c2.number_input("高 (km)", 0.1, 500.0, 10.0)
         r = 0
     else:
-        r = st.number_input("半径 (km)", 1.0, 200.0, 5.0)
+        r = st.number_input("半径 (km)", 0.1, 200.0, 5.0)
         w, h = 0, 0
         
     st.divider()
     api_key = st.text_input("🔑 OpenTopo API Key", type="password")
+    if not api_key:
+        st.caption("⚠️ 注意：COP30 数据通常必须要有 API Key 才能下载")
 
 # --- 5. 主界面 ---
 
 st.title("Geo Data Master")
-st.caption(f"当前: {st.session_state['addr']}")
+st.caption(f"当前中心: {st.session_state['addr']}")
 
 geom, desc = generate_geometry(st.session_state['lat'], st.session_state['lon'], shape, w, h, r)
 gdf = gpd.GeoDataFrame({'geometry': [geom]}, crs="EPSG:4326")
 bounds = geom.bounds
 
-# 地图
-m = folium.Map([st.session_state['lat'], st.session_state['lon']], zoom_start=11)
+# 地图 - 关键修复：添加动态 Key
+# 这里的 key=... 确保了当坐标改变时，地图会被完全重绘，而不是没反应
+map_key = f"map_{st.session_state['lat']}_{st.session_state['lon']}_{shape}_{w}_{h}_{r}"
+
+m = folium.Map([st.session_state['lat'], st.session_state['lon']], zoom_start=12)
 folium.GeoJson(gdf, style_function=lambda x: {'color':'#007AFF', 'fillOpacity':0.2}).add_to(m)
-st_folium(m, height=400, width="100%")
+folium.Marker([st.session_state['lat'], st.session_state['lon']]).add_to(m)
+
+# 渲染地图
+st_folium(m, height=400, width="100%", key=map_key)
 
 st.divider()
 
@@ -159,12 +167,13 @@ with c2:
     
     if st.button("🚀 获取 DEM", use_container_width=True):
         if not api_key:
-            st.error("需要 API Key")
+            st.error("请在侧边栏填写 API Key (必填)")
         else:
-            with st.spinner("下载中..."):
+            with st.spinner(f"正在下载 {desc} 范围的 DEM 数据..."):
                 ok, d = fetch_opentopo_dem(bounds, api_key)
                 if ok:
                     st.session_state['dem_data'] = d
+                    st.success("下载成功！请点击下方按钮保存。")
                     st.rerun()
                 else:
                     st.error(d)
