@@ -1,9 +1,9 @@
 streamlit
+shapely>=2.0
+pyogrio
 geopandas
-shapely
 folium
 streamlit-folium
 geopy
 requests
 xyzservices
-pyogrio
